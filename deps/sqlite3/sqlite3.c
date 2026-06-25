@@ -71278,6 +71278,10 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
       }
       pWal->hdr = pWal->pCoRead->hdr;  /* read at anchor's frame, not live head */
       pWal->readLock = eLock;
+      /* We jumped pWal->hdr to a frame that differs from whatever the caller
+      ** last read at, so its page cache is stale for this snapshot. Force the
+      ** pager to reset by reporting the read point as changed. */
+      if( pChanged ) *pChanged = 1;
     }else
 #endif
     {

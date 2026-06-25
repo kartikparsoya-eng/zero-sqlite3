@@ -1,5 +1,5 @@
 diff --git a/deps/sqlite3/sqlite3.c b/deps/sqlite3/sqlite3.c
-index 27de0ae..70d166a 100644
+index 27de0ae..d5ae0bc 100644
 --- a/deps/sqlite3/sqlite3.c
 +++ b/deps/sqlite3/sqlite3.c
 @@ -59357,6 +59357,12 @@ SQLITE_PRIVATE int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapsho
@@ -100,7 +100,7 @@ index 27de0ae..70d166a 100644
  static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
    volatile WalCkptInfo *pInfo;    /* Checkpoint information in wal-index */
    int rc = SQLITE_OK;             /* Return code  */
-@@ -71190,6 +71260,27 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+@@ -71190,6 +71260,31 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
    pInfo = walCkptInfo(pWal);
    SEH_INJECT_FAULT;
    if( isWalMode2(pWal) ){
@@ -122,13 +122,17 @@ index 27de0ae..70d166a 100644
 +      }
 +      pWal->hdr = pWal->pCoRead->hdr;  /* read at anchor's frame, not live head */
 +      pWal->readLock = eLock;
++      /* We jumped pWal->hdr to a frame that differs from whatever the caller
++      ** last read at, so its page cache is stale for this snapshot. Force the
++      ** pager to reset by reporting the read point as changed. */
++      if( pChanged ) *pChanged = 1;
 +    }else
 +#endif
 +    {
      /* This connection needs a "part" lock on the current wal file and,
      ** unless pInfo->nBackfill is set to indicate that it has already been
      ** checkpointed, a "full" lock on the other wal file.  */
-@@ -71216,6 +71307,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+@@ -71216,6 +71311,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
        pWal->readLock = eLock;
      }
      assert( pWal->minFrame==0 && walFramePage(pWal->minFrame)==0 );

@@ -1,0 +1,138 @@
+diff --git a/deps/sqlite3/sqlite3.c b/deps/sqlite3/sqlite3.c
+index 27de0ae..70d166a 100644
+--- a/deps/sqlite3/sqlite3.c
++++ b/deps/sqlite3/sqlite3.c
+@@ -59357,6 +59357,12 @@ SQLITE_PRIVATE int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapsho
+ SQLITE_PRIVATE void sqlite3WalSnapshotUnlock(Wal *pWal);
+ #endif
+ 
++#ifdef SQLITE_ENABLE_WAL2_COREAD
++typedef struct WalCoRead WalCoRead;
++SQLITE_PRIVATE int sqlite3WalCoReadGet(Wal *pAnchor, WalCoRead *pOut);
++SQLITE_PRIVATE void sqlite3WalCoReadOpen(Wal *pWal, const WalCoRead *pCoRead);
++#endif
++
+ #ifndef SQLITE_OMIT_CONCURRENT
+ /* Tell the wal layer that we want to commit a concurrent transaction */
+ SQLITE_PRIVATE int sqlite3WalLockForCommit(Wal *pWal, PgHdr *pPg, Bitvec *pRead, u32*);
+@@ -67983,6 +67989,21 @@ struct WalIndexHdr {
+   u32 aCksum[2];                  /* Checksum over all prior fields */
+ };
+ 
++#ifdef SQLITE_ENABLE_WAL2_COREAD
++/*
++** WAL2 "co-located read" capture (experimental scaffold; see
++** sqlite3WalCoReadGet()). Records the read point of an "anchor" read
++** transaction so other connections can latch the SAME wal2 frame and the
++** SAME part/full read-lock class the anchor holds. Opaque above the WAL
++** module. The anchor read transaction MUST outlive every co-located reader.
++*/
++typedef struct WalCoRead WalCoRead;
++struct WalCoRead {
++  WalIndexHdr hdr;   /* The anchor's wal-index header (its pinned frame) */
++  int eLock;         /* The part/full read-lock class the anchor holds */
++};
++#endif /* SQLITE_ENABLE_WAL2_COREAD */
++
+ /*
+ ** The following macros and functions are get/set methods for the maximum
+ ** frame numbers and current wal file values stored in the WalIndexHdr
+@@ -68237,6 +68258,9 @@ struct Wal {
+ #ifdef SQLITE_ENABLE_SNAPSHOT
+   WalIndexHdr *pSnapshot;    /* Start transaction here if not NULL */
+   int bGetSnapshot;          /* Transaction opened for sqlite3_get_snapshot() */
++#endif
++#ifdef SQLITE_ENABLE_WAL2_COREAD
++  const WalCoRead *pCoRead;  /* If !NULL, begin read at this wal2 co-read point */
+ #endif
+   int bClosing;              /* Set to true at start of sqlite3WalClose() */
+   int bWal2;                 /* bWal2 flag passed to WalOpen() */
+@@ -71080,6 +71104,52 @@ static int walBeginShmUnreliable(Wal *pWal, int *pChanged){
+ ** so it takes care to hold an exclusive lock on the corresponding
+ ** WAL_READ_LOCK() while changing values.
+ */
++
++#ifdef SQLITE_ENABLE_WAL2_COREAD
++/*
++** WAL2 co-located read (experimental scaffold). See the WalCoRead comment
++** near the WalIndexHdr definition. These let K connections latch the SAME
++** wal2 frame an anchor read-transaction already holds, WITHOUT the general
++** sqlite3_snapshot machinery (which is disabled in wal2 mode). Correctness
++** rests on: (1) the caller keeps the anchor read transaction OPEN for the
++** lifetime of every co-located reader, so the anchor's read-lock protects
++** these frames against reset; (2) the fail-closed walCoReadStillValid()
++** check. NOT production-ready: validity is salt-only -- prove with the
++** corruption-test gauntlet before enabling on a real replica.
++*/
++
++/* Capture an anchor's current read point. The anchor must be in wal2 mode
++** and currently hold a read transaction (readLock>=0). */
++SQLITE_PRIVATE int sqlite3WalCoReadGet(Wal *pAnchor, WalCoRead *pOut){
++  if( pAnchor==0 || pOut==0 ) return SQLITE_MISUSE;
++  if( !isWalMode2(pAnchor) ) return SQLITE_ERROR;   /* co-read is wal2-only */
++  if( pAnchor->readLock<0 ) return SQLITE_ERROR;    /* anchor not in a read tx */
++  memset(pOut, 0, sizeof(*pOut));
++  pOut->hdr   = pAnchor->hdr;       /* the frame the anchor is pinned at */
++  pOut->eLock = pAnchor->readLock;  /* the part/full lock class it holds */
++  return SQLITE_OK;
++}
++
++/* Arm the next read transaction on pWal to begin at pCoRead's frame instead
++** of the live head. Pass NULL to clear. Mirrors sqlite3WalSnapshotOpen(). */
++SQLITE_PRIVATE void sqlite3WalCoReadOpen(Wal *pWal, const WalCoRead *pCoRead){
++  pWal->pCoRead = pCoRead;
++}
++
++/* Conservative validity check for a co-located begin (fail-closed). Returns
++** true only if the captured wal2 header still matches the live wal-index
++** salt for its file -- i.e. the file holding the captured frames has NOT
++** been reset/rotated since capture. SCAFFOLD: salt-only; a production check
++** must also reconcile the two-file mxFrame2 encoding and backfill state. */
++static int walCoReadStillValid(Wal *pWal, const WalCoRead *pCo){
++  volatile WalIndexHdr *pLive = walIndexHdr(pWal);
++  if( pCo->hdr.iVersion!=WAL_VERSION2 ) return 0;      /* not a wal2 capture */
++  if( pCo->hdr.aSalt[0]!=pLive->aSalt[0] ) return 0;   /* file generation moved */
++  if( pCo->hdr.aSalt[1]!=pLive->aSalt[1] ) return 0;
++  return 1;
++}
++#endif /* SQLITE_ENABLE_WAL2_COREAD */
++
+ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+   volatile WalCkptInfo *pInfo;    /* Checkpoint information in wal-index */
+   int rc = SQLITE_OK;             /* Return code  */
+@@ -71190,6 +71260,27 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+   pInfo = walCkptInfo(pWal);
+   SEH_INJECT_FAULT;
+   if( isWalMode2(pWal) ){
++#ifdef SQLITE_ENABLE_WAL2_COREAD
++    if( pWal->pCoRead ){
++      /* Co-located read: adopt the anchor's pinned frame + the SAME shared
++      ** part/full read-lock class instead of latching the live head. The
++      ** anchor's still-held lock protects these frames; walCoReadStillValid()
++      ** fails closed if the file rotated out from under us. */
++      int eLock = pWal->pCoRead->eLock;
++      rc = walLockShared(pWal, WAL_READ_LOCK(eLock));
++      if( rc!=SQLITE_OK ){
++        return (rc==SQLITE_BUSY ? WAL_RETRY : rc);
++      }
++      walShmBarrier(pWal);
++      if( !walCoReadStillValid(pWal, pWal->pCoRead) ){
++        walUnlockShared(pWal, WAL_READ_LOCK(eLock));
++        return SQLITE_ERROR_SNAPSHOT;  /* caller falls back to serial */
++      }
++      pWal->hdr = pWal->pCoRead->hdr;  /* read at anchor's frame, not live head */
++      pWal->readLock = eLock;
++    }else
++#endif
++    {
+     /* This connection needs a "part" lock on the current wal file and,
+     ** unless pInfo->nBackfill is set to indicate that it has already been
+     ** checkpointed, a "full" lock on the other wal file.  */
+@@ -71216,6 +71307,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+       pWal->readLock = eLock;
+     }
+     assert( pWal->minFrame==0 && walFramePage(pWal->minFrame)==0 );
++    }
+   }else
+   {
+     u32 mxReadMark;               /* Largest aReadMark[] value */

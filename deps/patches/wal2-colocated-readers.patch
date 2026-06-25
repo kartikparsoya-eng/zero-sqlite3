@@ -1,5 +1,5 @@
 diff --git a/deps/sqlite3/sqlite3.c b/deps/sqlite3/sqlite3.c
-index 27de0ae..d5ae0bc 100644
+index 27de0ae..aafcf10 100644
 --- a/deps/sqlite3/sqlite3.c
 +++ b/deps/sqlite3/sqlite3.c
 @@ -59357,6 +59357,12 @@ SQLITE_PRIVATE int sqlite3WalSnapshotCheck(Wal *pWal, sqlite3_snapshot *pSnapsho
@@ -47,7 +47,7 @@ index 27de0ae..d5ae0bc 100644
  #endif
    int bClosing;              /* Set to true at start of sqlite3WalClose() */
    int bWal2;                 /* bWal2 flag passed to WalOpen() */
-@@ -71080,6 +71104,52 @@ static int walBeginShmUnreliable(Wal *pWal, int *pChanged){
+@@ -71080,6 +71104,64 @@ static int walBeginShmUnreliable(Wal *pWal, int *pChanged){
  ** so it takes care to hold an exclusive lock on the corresponding
  ** WAL_READ_LOCK() while changing values.
  */
@@ -83,24 +83,36 @@ index 27de0ae..d5ae0bc 100644
 +  pWal->pCoRead = pCoRead;
 +}
 +
-+/* Conservative validity check for a co-located begin (fail-closed). Returns
-+** true only if the captured wal2 header still matches the live wal-index
-+** salt for its file -- i.e. the file holding the captured frames has NOT
-+** been reset/rotated since capture. SCAFFOLD: salt-only; a production check
-+** must also reconcile the two-file mxFrame2 encoding and backfill state. */
++/* Validity check for a co-located begin (fail-closed). Returns true only if
++** the file holding the anchor's captured frame has NOT been restarted/reset
++** since capture. Two-file aware (the salt in WalIndexHdr is only the CURRENT
++** file's, so a naive salt compare fails-closed on every file switch):
++**   - anchor's file is still the current file -> compare in-memory salt (cheap).
++**   - anchor's file is now the OTHER (non-current) file -> read its on-disk WAL
++**     header salt; if unchanged the file was not restarted, so the anchor's
++**     frames are intact (its still-held read-lock blocked any reset). Safe to
++**     read here: walTryBeginRead already took the shared part/full read-lock. */
 +static int walCoReadStillValid(Wal *pWal, const WalCoRead *pCo){
 +  volatile WalIndexHdr *pLive = walIndexHdr(pWal);
-+  if( pCo->hdr.iVersion!=WAL_VERSION2 ) return 0;      /* not a wal2 capture */
-+  if( pCo->hdr.aSalt[0]!=pLive->aSalt[0] ) return 0;   /* file generation moved */
-+  if( pCo->hdr.aSalt[1]!=pLive->aSalt[1] ) return 0;
-+  return 1;
++  int fa, fl;
++  if( pCo->hdr.iVersion!=WAL_VERSION2 ) return 0;       /* not a wal2 capture */
++  fa = walidxGetFile(&pCo->hdr);                        /* file with anchor frame */
++  fl = (int)(pLive->mxFrame2 >> 31);                    /* live current file */
++  if( fa==fl ){
++    return memcmp((void*)pCo->hdr.aSalt, (void*)pLive->aSalt, 8)==0;
++  }else{
++    u8 aHdr[WAL_HDRSIZE];
++    if( !isOpen(pWal->apWalFd[fa]) ) return 0;
++    if( sqlite3OsRead(pWal->apWalFd[fa], aHdr, WAL_HDRSIZE, 0)!=SQLITE_OK ) return 0;
++    return memcmp(&aHdr[16], (void*)pCo->hdr.aSalt, 8)==0;
++  }
 +}
 +#endif /* SQLITE_ENABLE_WAL2_COREAD */
 +
  static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
    volatile WalCkptInfo *pInfo;    /* Checkpoint information in wal-index */
    int rc = SQLITE_OK;             /* Return code  */
-@@ -71190,6 +71260,31 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+@@ -71190,6 +71272,31 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
    pInfo = walCkptInfo(pWal);
    SEH_INJECT_FAULT;
    if( isWalMode2(pWal) ){
@@ -132,7 +144,7 @@ index 27de0ae..d5ae0bc 100644
      /* This connection needs a "part" lock on the current wal file and,
      ** unless pInfo->nBackfill is set to indicate that it has already been
      ** checkpointed, a "full" lock on the other wal file.  */
-@@ -71216,6 +71311,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
+@@ -71216,6 +71323,7 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int *pCnt){
        pWal->readLock = eLock;
      }
      assert( pWal->minFrame==0 && walFramePage(pWal->minFrame)==0 );

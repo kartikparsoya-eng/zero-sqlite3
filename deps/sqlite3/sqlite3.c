@@ -71136,17 +71136,29 @@ SQLITE_PRIVATE void sqlite3WalCoReadOpen(Wal *pWal, const WalCoRead *pCoRead){
   pWal->pCoRead = pCoRead;
 }
 
-/* Conservative validity check for a co-located begin (fail-closed). Returns
-** true only if the captured wal2 header still matches the live wal-index
-** salt for its file -- i.e. the file holding the captured frames has NOT
-** been reset/rotated since capture. SCAFFOLD: salt-only; a production check
-** must also reconcile the two-file mxFrame2 encoding and backfill state. */
+/* Validity check for a co-located begin (fail-closed). Returns true only if
+** the file holding the anchor's captured frame has NOT been restarted/reset
+** since capture. Two-file aware (the salt in WalIndexHdr is only the CURRENT
+** file's, so a naive salt compare fails-closed on every file switch):
+**   - anchor's file is still the current file -> compare in-memory salt (cheap).
+**   - anchor's file is now the OTHER (non-current) file -> read its on-disk WAL
+**     header salt; if unchanged the file was not restarted, so the anchor's
+**     frames are intact (its still-held read-lock blocked any reset). Safe to
+**     read here: walTryBeginRead already took the shared part/full read-lock. */
 static int walCoReadStillValid(Wal *pWal, const WalCoRead *pCo){
   volatile WalIndexHdr *pLive = walIndexHdr(pWal);
-  if( pCo->hdr.iVersion!=WAL_VERSION2 ) return 0;      /* not a wal2 capture */
-  if( pCo->hdr.aSalt[0]!=pLive->aSalt[0] ) return 0;   /* file generation moved */
-  if( pCo->hdr.aSalt[1]!=pLive->aSalt[1] ) return 0;
-  return 1;
+  int fa, fl;
+  if( pCo->hdr.iVersion!=WAL_VERSION2 ) return 0;       /* not a wal2 capture */
+  fa = walidxGetFile(&pCo->hdr);                        /* file with anchor frame */
+  fl = (int)(pLive->mxFrame2 >> 31);                    /* live current file */
+  if( fa==fl ){
+    return memcmp((void*)pCo->hdr.aSalt, (void*)pLive->aSalt, 8)==0;
+  }else{
+    u8 aHdr[WAL_HDRSIZE];
+    if( !isOpen(pWal->apWalFd[fa]) ) return 0;
+    if( sqlite3OsRead(pWal->apWalFd[fa], aHdr, WAL_HDRSIZE, 0)!=SQLITE_OK ) return 0;
+    return memcmp(&aHdr[16], (void*)pCo->hdr.aSalt, 8)==0;
+  }
 }
 #endif /* SQLITE_ENABLE_WAL2_COREAD */
 

@@ -11275,6 +11275,30 @@ SQLITE_API int sqlite3_snapshot_open(
 */
 SQLITE_API void sqlite3_snapshot_free(sqlite3_snapshot*);
 
+#ifdef SQLITE_ENABLE_WAL2_COREAD
+/*
+** CAPI3REF: WAL2 co-located read handle
+**
+** An sqlite3_wal2_coread object records the read point (wal2 frame + part/full
+** read-lock class) of an "anchor" read transaction, so that other connections
+** can be made to begin a read transaction at the SAME frame. This is the wal2
+** counterpart to [sqlite3_snapshot], which is disabled in wal2 mode.
+**
+** Obtain one with sqlite3_wal2_coread_get() (the anchor must be in an open
+** read transaction on a wal2 database). Arm another connection's next read
+** transaction onto it with sqlite3_wal2_coread_open(). Release with
+** sqlite3_wal2_coread_free(). The anchor read transaction MUST remain open for
+** the lifetime of every co-located reader.
+**
+** These interfaces are only available when SQLite is compiled with the
+** SQLITE_ENABLE_WAL2_COREAD option.
+*/
+typedef struct sqlite3_wal2_coread sqlite3_wal2_coread;
+SQLITE_API int sqlite3_wal2_coread_get(sqlite3 *db, const char *zSchema, sqlite3_wal2_coread **ppCoRead);
+SQLITE_API int sqlite3_wal2_coread_open(sqlite3 *db, const char *zSchema, sqlite3_wal2_coread *pCoRead);
+SQLITE_API void sqlite3_wal2_coread_free(sqlite3_wal2_coread *pCoRead);
+#endif /* SQLITE_ENABLE_WAL2_COREAD */
+
 /*
 ** CAPI3REF: Compare the ages of two snapshot handles.
 ** METHOD: sqlite3_snapshot
@@ -67381,6 +67405,32 @@ SQLITE_PRIVATE void sqlite3PagerSnapshotUnlock(Pager *pPager){
 }
 
 #endif /* SQLITE_ENABLE_SNAPSHOT */
+
+#ifdef SQLITE_ENABLE_WAL2_COREAD
+/*
+** Pager pass-throughs for the wal2 co-located-read API. Mirror
+** sqlite3PagerSnapshotGet/Open. WalCoRead is opaque here (forward-declared
+** above); these just forward to the wal layer when this is a WAL pager. The
+** WalCoRead buffer is owned by the caller (the public sqlite3_wal2_coread_*
+** layer), not allocated here.
+*/
+SQLITE_PRIVATE int sqlite3PagerCoReadGet(Pager *pPager, WalCoRead *pOut){
+  int rc = SQLITE_ERROR;
+  if( pPager->pWal ){
+    rc = sqlite3WalCoReadGet(pPager->pWal, pOut);
+  }
+  return rc;
+}
+SQLITE_PRIVATE int sqlite3PagerCoReadOpen(Pager *pPager, const WalCoRead *pCoRead){
+  int rc = SQLITE_OK;
+  if( pPager->pWal ){
+    sqlite3WalCoReadOpen(pPager->pWal, pCoRead);
+  }else{
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+#endif /* SQLITE_ENABLE_WAL2_COREAD */
 
 SQLITE_PRIVATE int sqlite3PagerWalInfo(Pager *pPager, u32 *pnPrior, u32 *pnFrame){
   return sqlite3WalInfo(pPager->pWal, pnPrior, pnFrame);
@@ -192880,6 +192930,96 @@ SQLITE_API void sqlite3_snapshot_free(sqlite3_snapshot *pSnapshot){
   sqlite3_free(pSnapshot);
 }
 #endif /* SQLITE_ENABLE_SNAPSHOT */
+
+#ifdef SQLITE_ENABLE_WAL2_COREAD
+/*
+** WAL2 co-located read: public surface. Mirrors the sqlite3_snapshot_* chain
+** but targets wal2 mode, where sqlite3_snapshot_open() is hard-disabled. Lets
+** K connections latch the SAME wal2 frame an anchor read-transaction holds.
+**
+** The handle is a heap copy of the wal layer's WalCoRead capture, owned by the
+** caller and released with sqlite3_wal2_coread_free(). Freeing the handle does
+** NOT release the anchor's pinned frame -- the anchor's own read transaction
+** does that when it ends, which is why the anchor MUST outlive every reader.
+*/
+SQLITE_API int sqlite3_wal2_coread_get(
+  sqlite3 *db,
+  const char *zDb,
+  sqlite3_wal2_coread **ppCoRead
+){
+  int rc = SQLITE_ERROR;
+#ifndef SQLITE_OMIT_WAL
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || ppCoRead==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  sqlite3_mutex_enter(db->mutex);
+  if( db->autoCommit==0 ){
+    int iDb = sqlite3FindDbName(db, zDb);
+    if( iDb==0 || iDb>1 ){
+      Btree *pBt = db->aDb[iDb].pBt;
+      if( SQLITE_TXN_WRITE!=sqlite3BtreeTxnState(pBt) ){
+        WalCoRead *pNew = (WalCoRead*)sqlite3_malloc(sizeof(WalCoRead));
+        if( pNew==0 ){
+          rc = SQLITE_NOMEM_BKPT;
+        }else{
+          rc = sqlite3PagerCoReadGet(sqlite3BtreePager(pBt), pNew);
+          if( rc==SQLITE_OK ){
+            *ppCoRead = (sqlite3_wal2_coread*)pNew;
+          }else{
+            sqlite3_free(pNew);
+          }
+        }
+      }
+    }
+  }
+  sqlite3_mutex_leave(db->mutex);
+#endif   /* SQLITE_OMIT_WAL */
+  return rc;
+}
+
+SQLITE_API int sqlite3_wal2_coread_open(
+  sqlite3 *db,
+  const char *zDb,
+  sqlite3_wal2_coread *pCoRead
+){
+  int rc = SQLITE_ERROR;
+#ifndef SQLITE_OMIT_WAL
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || pCoRead==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  sqlite3_mutex_enter(db->mutex);
+  if( db->autoCommit==0 ){
+    int iDb = sqlite3FindDbName(db, zDb);
+    if( iDb==0 || iDb>1 ){
+      Btree *pBt = db->aDb[iDb].pBt;
+      /* Arm-then-begin: the caller has issued a deferred BEGIN (no read lock
+      ** taken yet, so the schema's transaction state is NONE) and calls this
+      ** before its first read. We point the pager at the co-read capture, then
+      ** begin the read transaction (which latches the anchor's frame inside
+      ** walTryBeginRead), then disarm so the next transaction is normal. */
+      if( sqlite3BtreeTxnState(pBt)==SQLITE_TXN_NONE ){
+        Pager *pPager = sqlite3BtreePager(pBt);
+        rc = sqlite3PagerCoReadOpen(pPager, (const WalCoRead*)pCoRead);
+        if( rc==SQLITE_OK ){
+          rc = sqlite3BtreeBeginTrans(pBt, 0, 0);
+          sqlite3PagerCoReadOpen(pPager, 0);
+        }
+      }
+    }
+  }
+  sqlite3_mutex_leave(db->mutex);
+#endif   /* SQLITE_OMIT_WAL */
+  return rc;
+}
+
+SQLITE_API void sqlite3_wal2_coread_free(sqlite3_wal2_coread *pCoRead){
+  sqlite3_free(pCoRead);
+}
+#endif /* SQLITE_ENABLE_WAL2_COREAD */
 
 SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_wal_info(
   sqlite3 *db, const char *zDb,
